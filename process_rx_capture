@@ -1,0 +1,104 @@
+% process_rx_capture.m
+% Load captured USRP RX file, frame-sync, dechirp, range/Doppler, plot.
+
+clear; clc; close all;
+
+%Parameters (must match TX & GRC)
+Fs = 25e6;                 % sample rate (Hz)
+T  = 80e-6;                % chirp duration (s)
+B  = 12e6;                 % bandwidth (Hz)
+M  = 256;                  % chirps to use in the Doppler FFT (<= captured)
+
+%for axes only
+c  = 3e8;
+fc = 2.4e9;                % carrier used on RF front-end
+lambda = c/fc;
+
+%Input capture (float32 interleaved I/Q)
+rx_file = 'test4.dat';     % <-- set to your capture file
+
+fid = fopen(rx_file,'rb');
+assert(fid>0, 'Cannot open %s', rx_file);
+raw = fread(fid,[2,Inf],'float32'); fclose(fid);
+rx  = raw(1,:).' + 1j*raw(2,:).';
+
+%derived stuff
+Ns = round(Fs*T);          % samples per chirp
+Slope = B/T;
+
+%TX replica (must match TX generation)
+t  = (0:Ns-1).'/Fs;
+k  = B/T;
+tx_chirp = exp(1j*pi*k*t.^2);
+
+%Frame sync: locate first chirp boundary
+% Use FFT-based correlation in a probe window
+Lprobe = min(numel(rx), 4*Ns);
+rprobe = rx(1:Lprobe);
+Ncorr  = 4*Ns;
+C = abs(ifft( fft(rprobe,Ncorr) .* conj(fft(tx_chirp,Ncorr)) ));
+[~, i0] = max(C(1:Ns));    % first peak within one-chirp span
+
+%Align and reshape into chirps
+rx = rx(i0:end);
+K  = floor(numel(rx)/Ns);
+rx = rx(1:K*Ns);
+rx_mat = reshape(rx, Ns, K);
+
+%Use M chirps (or as many as available)
+if K < M
+    warning('Only %d chirps available; using those.', K);
+    M = K;
+end
+rx_mat = rx_mat(:,1:M);
+
+%Dechirp
+dechirped = rx_mat .* conj(tx_chirp);
+
+% for moving opject keep: remove stationary clutter 
+% if looking for stationary remove this line 
+dechirped = dechirped - mean(dechirped,2);
+
+%Range FFT (Fast
+Rpad = 8;                                 % cosmetic zero-padding
+win_r = hann(Ns,'periodic');
+Xr = fft(dechirped .* win_r, Rpad*Ns, 1);
+
+%Keep positive freqs; drop DC row to suppress residual LO/DC
+Xr = Xr(2:floor(end/2), :);
+
+%Range axis
+Nfft_r = size(Xr,1);
+fb = (0:Nfft_r-1).' * (Fs/(Rpad*Ns));     % beat frequency (Hz)
+range_axis = (c * fb) / (2*Slope);       % meters
+
+%Doppler FFT (slow
+Dpad = 16;                                % cosmetic zero-padding
+%mild high-pass across chirps to reduce slow drift/clutter
+Xr_hp = Xr - mean(Xr,2);
+win_d = hann(M,'periodic').';
+Xd = fftshift( fft(Xr_hp .* win_d, Dpad*M, 2), 2 );
+
+%normalize and convert to dB
+mag = abs(Xd); mag = mag ./ max(mag(:));
+mag_db = 20*log10(mag + eps);
+
+%velocity axis
+PRF = 1/T;
+fd_axis = linspace(-PRF/2, PRF/2, Dpad*M);  % Hz
+vel_axis = (lambda/2) * fd_axis;            % m/s
+vel_mph  = vel_axis * 2.23694;
+
+%plot
+figure('Color','w');
+imagesc(vel_mph, range_axis, mag_db);
+set(gca,'YDir','normal');
+xlabel('Velocity (mph)'); ylabel('Range (m)');
+title('Range Doppler Map');
+colorbar; shading interp; grid on;
+dyn = 30; caxis([max(mag_db(:))-dyn, max(mag_db(:))]);
+xlim([-20 20]); ylim([0 20]);
+
+fprintf('Done. Ns=%d, captured chirps=%d, using M=%d\n', Ns, K, M);
+fprintf('ΔR ≈ c/(2B) = %.2f m,  Δv (bin) ≈ (λ/2)*(PRF/M) = %.2f mph\n', ...
+        c/(2*B), (lambda/2)*(PRF/M)*2.23694);
