@@ -1,0 +1,141 @@
+% process_rx_capture.m
+% Load USRP RX file (float32 interleaved I/Q), frame-sync to chirps,
+% dechirp, build range–Doppler, and plot.
+% Works for loopback (keep DC) and moving-target (clutter-suppressed) modes.
+
+clear; clc; close all;
+
+%% ========= USER SETTINGS =========
+LOOPBACK_MODE = true;                                   % true: cable/attenuator loopback; false: moving targets
+rx_file = '/Users/macyvarga/fall_sr_dsgn/loopback.dat'; % <-- path to your GRC File Sink output
+
+% Must match TX & GNU Radio
+Fs = 10e6;               % sample rate (Hz)
+T  = 80e-6;              % chirp duration (s)
+B  = 12e6;               % sweep bandwidth (Hz)
+M  = 256;                % chirps used in Doppler FFT (<= captured)
+
+% Velocity axis only
+c  = 3e8;
+fc = 2.4e9;              % RF carrier used
+lambda = c/fc;
+%% =================================
+
+%% ---------- LOAD RAW I/Q ----------
+fid = fopen(rx_file,'rb');  assert(fid>0, 'Cannot open %s', rx_file);
+raw = fread(fid,[2,Inf],'float32'); fclose(fid);
+rx  = raw(1,:).' + 1j*raw(2,:).';
+
+%% ---------- DERIVED ----------
+Ns    = round(Fs*T);         % samples/chirp
+Slope = B/T;                 % Hz/s
+PRF   = 1/T;                 % chirps per second
+
+% Theoretical limits (helpful prints)
+Rmax  = (c*Fs)/(4*Slope);    % max unambiguous range (m)
+dR    = c/(2*B);             % range resolution (m)
+dv    = (lambda/2)*(PRF/M)*2.23694;  % velocity bin spacing (mph)
+
+%% ---------- TX CHIRP REPLICA ----------
+t = (0:Ns-1).'/Fs;  k = B/T;
+tx_chirp = exp(1j*pi*k*t.^2);
+
+%% ---------- FRAME SYNC ----------
+Lprobe = min(numel(rx), 4*Ns);
+rprobe = rx(1:Lprobe);
+Ncorr  = 4*Ns;
+C = abs(ifft( fft(rprobe,Ncorr) .* conj(fft(tx_chirp,Ncorr)) ));
+[~, i0] = max(C(1:Ns));              % first peak within one-chirp span
+
+rx = rx(i0:end);
+K  = floor(numel(rx)/Ns);             % # full chirps available
+rx = rx(1:K*Ns);
+rx_mat = reshape(rx, Ns, K);
+
+if K < M
+    warning('Only %d chirps available; using those.', K);
+    M = K;
+end
+rx_mat = rx_mat(:,1:M);
+
+%% ---------- DECHIRP ----------
+dechirped = rx_mat .* conj(tx_chirp);
+
+% Stationary clutter removal OFF for loopback
+if ~LOOPBACK_MODE
+    dechirped = dechirped - mean(dechirped,2);
+end
+
+%% ---------- RANGE FFT (fast-time) ----------
+Rpad  = 8;
+win_r = hann(Ns,'periodic');
+Xr = fft(dechirped .* win_r, Rpad*Ns, 1);
+
+% Keep positive freqs; in loopback keep DC row, otherwise drop it
+if LOOPBACK_MODE
+    Xr = Xr(1:floor(end/2), :);      % includes fb = 0
+else
+    Xr = Xr(2:floor(end/2), :);      % drop DC row to suppress LO/clutter
+end
+
+% Range axis
+Nfft_r = size(Xr,1);
+fb = (0:Nfft_r-1).' * (Fs/(Rpad*Ns));   % beat freq (Hz)
+range_axis = (c * fb) / (2*Slope);      % meters
+
+%% ---------- DOPPLER FFT (slow-time) ----------
+Dpad  = 16;
+win_d = hann(M,'periodic').';
+
+if LOOPBACK_MODE
+    Xd = fftshift( fft(Xr .* win_d, Dpad*M, 2), 2);          % no high-pass
+else
+    Xr_hp = Xr - mean(Xr,2);                                 % mild HP
+    Xd    = fftshift( fft(Xr_hp .* win_d, Dpad*M, 2), 2);
+end
+
+%% ---------- MAGNITUDE / dB ----------
+mag = abs(Xd);
+mag = mag ./ max(mag(:) + eps);
+mag_db = 20*log10(mag + eps);
+
+%% ---------- VELOCITY AXIS (exact FFT bin centers) ----------
+fd_axis = (-Dpad*M/2 : Dpad*M/2-1) * (PRF/(Dpad*M));   % Hz
+vel_axis = (lambda/2) * fd_axis;                       % m/s
+vel_mph  = vel_axis * 2.23694;                         % mph
+
+%% ---------- PLOT: Range–Doppler ----------
+figure('Color','w');
+imagesc(vel_mph, range_axis, mag_db);
+set(gca,'YDir','normal');
+xlabel('Velocity (mph)'); ylabel('Range (m)');
+ttl = 'Range–Doppler Map'; if LOOPBACK_MODE, ttl = [ttl ' (loopback)']; end
+title(ttl); colorbar; grid on; shading interp;
+
+dyn = 30;  caxis([max(mag_db(:))-dyn, max(mag_db(:))]);
+
+% Dynamic axes (don’t exceed physical Rmax)
+ylim([0, min(20, range_axis(end))]);    % true top is range_axis(end) ≈ Rmax
+xlim([min(vel_mph), max(vel_mph)]);
+
+%% ---------- DIAGNOSTICS ----------
+% Peak location
+[~,idx] = max(mag(:));
+[ir,id] = ind2sub(size(mag), idx);
+fprintf('Peak at range ≈ %.2f m, velocity ≈ %.2f mph\n', range_axis(ir), vel_mph(id));
+
+% 1-D cuts
+figure('Color','w'); 
+subplot(2,1,1);
+plot(range_axis, 20*log10(max(mag,[],2)+eps)); grid on;
+xlabel('Range (m)'); ylabel('Max |Xd| (dB)'); title('Range profile (max over Doppler)');
+xlim([0, range_axis(end)]);
+
+subplot(2,1,2);
+plot(vel_mph, 20*log10(max(mag,[],1)+eps)); grid on;
+xlabel('Velocity (mph)'); ylabel('Max |Xd| (dB)'); title('Doppler profile (max over Range)');
+xlim([min(vel_mph), max(vel_mph)]);
+
+%% ---------- Summary ----------
+fprintf('Done. Fs=%.1f MS/s, Ns=%d, captured chirps=%d, using M=%d\n', Fs/1e6, Ns, K, M);
+fprintf('ΔR ≈ %.2f m,  Δv(bin) ≈ %.2f mph,  Rmax ≈ %.2f m\n', dR, dv, range_axis(end));
